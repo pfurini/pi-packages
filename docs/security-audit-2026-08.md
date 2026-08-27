@@ -1,7 +1,7 @@
 # Security Audit Report — pi-packages (v0.11.1)
 
-- **Date:** 2026-08-26; third-pass verification and expansion 2026-08-27 (see [Verification addendum](#verification-addendum) and [Third-pass addendum](#third-pass-addendum-2026-08-27))
-- **Scope:** all source of `pi-auto-review` and `pi-sandbox` (~19.7k lines), scripts, CI workflows, configs.
+- **Date:** 2026-08-26; third-pass verification and expansion 2026-08-27 (see [Verification addendum](#verification-addendum) and [Third-pass addendum](#third-pass-addendum-2026-08-27)); fourth pass over the upstream v0.12.0 delta 2026-08-27 (see [Fourth pass](#fourth-pass-2026-08-27--upstream-v0120-delta))
+- **Scope:** all source of `pi-auto-review` and `pi-sandbox` (~19.7k lines), scripts, CI workflows, configs. The fourth pass extends this to the upstream v0.12.0 `policy-audit` subsystem (+1302 lines), previously unaudited.
 - **Method:** full manual read of every enforcement path (sandbox policy generation, broker, grants, overrides, host-IPC, external worker supervisor/launcher, subagent manager, reviewer pipeline), `npm audit` (0 vulnerabilities across 261 dependencies), manual secret scan (clean), opengrep/lens sweep. Findings independently re-verified by a second reviewer agent, re-checked against local `@anthropic-ai/sandbox-runtime` source, then re-verified a third time line-by-line against current source with **executable proof-of-concept** for the regex and address-range findings.
 - **Threat model:** these packages *are* the security boundary. The adversary is a malicious or prompt-injected agent process running inside the sandbox, trying to escape, escalate privileges, persist, or exfiltrate secrets.
 - **Verdict summary after third pass:** 2 High (confirmed against the pinned SRT 0.0.73), 3 Medium (1 confirmed, 1 reinstated from a wrong refutation, 1 new), 6 Low, plus 2 hygiene notes and 2 informational. No Critical under default configuration (host-IPC and external-worker isolation are both opt-in). M2 was downgraded to L8 on 2026-08-27 after reading the pinned permission system.
@@ -375,3 +375,82 @@ Recommended shape, unchanged and now better motivated: allow-list the legitimate
 **Mitigation today.** None of these is an allow: each falls through to the model reviewer. That backstop is thin (I1: `reasoning: "low"`, `maxTokens: 256`), so raising the reviewer budget for credential-shaped requests is a cheaper partial mitigation than extending the regex, and is worth doing first.
 
 **Suggested direction when this is picked up.** Normalize before matching — strip quoting, collapse `//` and `/./` in path-shaped tokens, expand clustered short flags — then match against the normalized form. Add `--data-ascii`, `--json`, `--body-file`, and a `tee` branch. Treat the enumerations as a last line, not the first. **Do not** ship it without adversarial review: this matcher has now produced three separate bypass classes across three attempts.
+
+---
+
+## Fourth pass (2026-08-27) — upstream v0.12.0 delta
+
+**Trigger:** upstream `2f17ceb` (v0.12.0) was merged into this branch as `269dcb9`. The merge itself was conflict-free and provably the exact union of two disjoint patches — the merged `pi-auto-review/src/index.ts` is byte-identical to `personal` plus upstream's complete 249-line patch *and* to `main` plus this branch's complete 181-line patch. Neither side lost a line, and `policy.ts` (which holds the F3 byte cap and the M4 segment class) was never touched by upstream. The merge therefore reverted no fix, but it imported ~1300 lines that had never been audited.
+
+**Scope:** exactly `git diff 3c02333 2f17ceb` — 15 files, +1302 lines, across `19b9d9f` (example config defaults), `31e71aa` (the policy-audit subsystem), and `11be3cd` (close idempotency). The four new `src/policy-audit/` files (store 298, classifier 234, index 172, report 140) were read in full.
+
+**Method:** adversarial review by `zai/glm-5.3` at maximum thinking budget, then the load-bearing claims re-verified by hand. Findings are numbered **U1-U5** to avoid colliding with the H/M/L/F identifiers above.
+
+**Verdict: safe to keep as merged, with fixes.** 3 Low, 2 Informational. No High, no Medium. Nothing in the delta weakens an enforcement path, persists credential material, or introduces an injection primitive.
+
+### Findings
+
+| ID | Severity | Finding | Disposition |
+|---|---|---|---|
+| U1 | Low | Example permission config widens `web_search` and `get_search_content` from the implicit `ask` fallback to `allow` | **Fixed** — both set back to `"ask"` |
+| U2 | Low | The audit store follows symlinks on its directory, key, and DB | **Open** — folded into H1 |
+| U3 | Low | Retention pruning runs only on the write path | **Open** |
+| U4 | Info | DB is briefly `0644` before `chmod 0600` | **No action** — no exposure |
+| U5 | Info | `close()` is not terminal; a late `record()` reopens the store | **Open** |
+
+### U1. Example config widens two egress-capable surfaces to `allow` [CONFIRMED — FIXED]
+
+`19b9d9f` added `todo`, `web_search`, `get_search_content` as `"allow"` and `fetch_content` as `"ask"` to `examples/pi-permission-system.config.example.json`. Verified by hand that the first three are genuine `ask`→`allow` transitions rather than restatements of a default: the pinned permission system's fallback for unlisted tools is `DEFAULT_UNIVERSAL_FALLBACK: PermissionState = "ask"` (`permission-manager.ts:43`). A prompt-injected model in a session configured from this example therefore gets an unprompted egress channel — `web_search` query text leaves the machine to the search provider with workspace data encoded in it.
+
+Severity is Low, not Medium, because the **shipped default is unaffected**: `src/config.json` gained only the `policyAudit` block. Only users who copy the example are exposed. The change is not mentioned in `CHANGELOG.md`.
+
+**Fixed here:** `web_search` and `get_search_content` set to `"ask"`. `todo` (local task list) keeps `"allow"`; `fetch_content` keeps upstream's `"ask"`, which is correct — the exfiltration-capable fetcher should prompt. No test or script reads this file, so nothing else moves. This is a deliberate divergence from upstream and will produce a small conflict on the next merge; that is preferable to silently shipping a reference config that disables the prompt on an egress tool.
+
+### U2. The audit store trusts pre-existing filesystem state [CONFIRMED — folded into H1]
+
+`store.ts:74-77` (directory), `:85-99` (`loadOrCreateKey`), `:110-111` (DB open). All three primitives were reproduced by probe on Node 26.7.0:
+
+- **Key substitution.** `openSync(O_CREAT|O_EXCL)` correctly refuses a pre-existing symlink, but the `EEXIST` fallback then `chmodSync` + `readFileSync` through the link, so the host proceeds with an attacker-chosen 32-byte HMAC key. Data collected under that key has reversible project-path and rule-pattern pseudonymization.
+- **DB redirect.** `new DatabaseSync(path)` follows a symlinked DB; a corrupt or wrong-`schema_version` target makes `open()` throw, disabling collection for every later session.
+- **Directory redirection.** `mkdirSync(recursive)` succeeds over an existing directory symlink, and the subsequent `chmodSync(dir, 0700)` retargets the link's target.
+
+The precondition is write access to `~/.pi/agent/extensions/pi-auto-review/`. The model cannot obtain it (the directory is inside the local write-deny set) and neither can an unprivileged local user (`0700` inside the user's home) — but **an H1-compromised external worker can**, because `allowWrite` still contains `agentDir`. This grants such an attacker nothing they do not already have; it is recorded because the delta *adds* four new poisonable artifacts under `agentDir`, which enlarges H1's blast radius.
+
+**Fix, when H1 is addressed:** `lstat` the directory, key, and DB at open and refuse any symlink (or open the key `O_NOFOLLOW` and treat `ELOOP` as fatal). The structural fix is denying `extensions/pi-auto-review/` while `agentDir` remains writable — the same allow-list redesign H1 already needs.
+
+### U3. Retention is enforced only on the write path [CONFIRMED — open]
+
+`pruneIfNeeded` (`store.ts:238-244`) has exactly one caller, `record` (`:219`); neither `open()` nor `query()` prunes. Setting `policyAudit.enabled: false` — a permitted project-level tightening — therefore freezes the database at its current contents indefinitely, and rows outlive the documented 180-day retention. This is a privacy and documentation-honesty gap, not an exploitation path. Fix: prune at the end of `initialize()` and at the top of `query()`.
+
+### U4 / U5 [CONFIRMED — no action / open]
+
+**U4:** `node:sqlite` creates the DB at `0644 & ~umask`, and `store.ts:111` chmods to `0600` immediately after construction and **before** `initialize()` writes any row; the file is already inside a `0700` directory. WAL and SHM inherit `0600`, re-asserted by `secureSidecars()` after every commit. No row ever exists in a readable mode, and the README's permission claims are accurate. No action.
+
+**U5:** the `11be3cd` close-idempotency fix is itself correct — three concurrent `close()` calls with a queued record produced no throw and no double-close. But `getStore` re-creates `storePromise` after `close()` clears it and `record` does not check for a closed controller, so a decision arriving after shutdown reopens the DB. Since pi emits `session_shutdown` on session *reload*, a stale in-flight decision can leave one live SQLite handle until the next shutdown. No data loss and no unhandled rejection. Fix: a controller-level `closed` latch making `record()` a no-op.
+
+### Refuted — recorded to bound future passes
+
+Each was an explicit interrogation target and each was answered against source or by execution:
+
+- **No credential material reaches disk.** Every persisted column is fixed-vocabulary or an HMAC-SHA256 digest; request IDs, project paths and matched patterns are hashed, and the test suite byte-scans DB + WAL + SHM for raw strings. The key is an **HMAC pseudonymization key, not an at-rest encryption key**, and the README describes it as such — the suspected overstated-protection claim does not exist.
+- **No SQL injection.** All statements are `?`-parameterized through Node's builtin `node:sqlite` (`store.ts:121`, hence the `engines: >=22.13.0` bump); the sole interpolated fragment is a fixed two-way ternary containing no attacker input.
+- **No classifier ReDoS witness** across 17 worst-case patterns up to 5 MB; worst observed 51 ms with clean linear scaling. See the caveat below.
+- **No path from audit failure to a permission verdict.** `record()` runs after the decision is broadcast, fire-and-forget, its queue catch backed by the host's per-handler try/catch. Unwritable directory, missing `node:sqlite`, corrupt DB, bad key length and closed-DB errors were each tested: all disable collection with one warning.
+- **No markdown, ANSI or prompt injection through the report** — all rendered strings are fixed-vocabulary, hex fingerprints or ISO dates, and the report goes to `pi.appendEntry`, never to the model.
+- **The model cannot invoke `/auto-review-policy-audit`** on the current host: extension `registerCommand` commands go to the TUI registry, while the model-facing `slash_command` tool is fed only file-based commands and prompt templates. Arguments are bounded regardless.
+- **No tighten-only bypass** in the new `policyAudit` project-config block.
+
+**Interaction with existing findings:** H1's blast radius grows by U2's four artifacts. H2, M1, F1, F5, F6 and L9: no interaction — the subsystem reads no environment variables and adds no sandbox-surface code.
+
+### Test-quality assessment
+
+Upstream's tests pin security properties rather than the happy path: file modes asserted, DB/WAL/SHM byte-scanned for raw strings, tighten-only including re-enable rejection, corruption-not-rebuilt, cross-project isolation, dedup, and argument bounds. Gaps worth closing: the `11be3cd` concurrent-close fix has **no test** (verified only by probe); no symlink-tamper test (U2); no retention-when-disabled test (U3); and — notably — **no classifier linearity regression test**, so the M4 lesson recorded in this document was not applied to the new regexes.
+
+### Confidence and limits
+
+Verified by execution on Node 26.7.0: file modes under hostile umask, symlink behaviour of every open path, classifier timing across 17 patterns, and concurrent close. Verified by hand afterwards: the U1 default transitions against `permission-manager.ts:43`, the unchanged shipped default in `src/config.json`, and the `node:sqlite` driver identity. Some `file:line` citations in the reviewer's report drift by one or two lines from current HEAD; the substance held everywhere it was sampled.
+
+**Not established:** sustained multi-session WAL contention (the busy-then-disable behaviour is inferred from `busy_timeout=75` plus 3 retries, never observed under load); behaviour on network filesystems with broken POSIX locking; Node 22.13-25 specifically, since probes ran on 26.7.0.
+
+**Where this may be wrong:** the ReDoS refutation is an absence of a witness, not a proof — and M4 is precisely the case where hand-inspection and a passing harness both returned the wrong answer. The cheap mitigation is to cap the command length fed to `classifyPermission`, mirroring the existing `MAX_HARD_DENY_COMMAND_BYTES` cap. U2's severity assumes H1 is the only way to plant files in the audit directory; another local write primitive would widen it.
+
