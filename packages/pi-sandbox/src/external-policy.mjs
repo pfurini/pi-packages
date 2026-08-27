@@ -22,15 +22,27 @@ function isWithin(parent, child) {
  * worker, since a stale entry should not be fatal.
  */
 export function sanitizeExternalReadPaths(raw, { cwd, agentDir }) {
-  const roots = [resolve(cwd), resolve(agentDir)];
   const allowed = [];
   for (const entry of String(raw ?? "").split(":")) {
-    if (!entry || !isAbsolute(entry)) continue;
-    const candidate = resolve(entry);
-    if (!roots.some((root) => isWithin(root, candidate))) continue;
-    if (!allowed.includes(candidate)) allowed.push(candidate);
+    const candidate = containedPath(entry, { cwd, agentDir });
+    if (candidate && !allowed.includes(candidate)) allowed.push(candidate);
   }
   return allowed;
+}
+
+/**
+ * Resolve `value` and return it only when it is absolute and contained by the
+ * workspace or the agent directory. Shared by every environment-sourced path,
+ * read or write: `PI_CODING_AGENT_SESSION_DIR` reaches the launcher on exactly
+ * the same footing as `PI_SANDBOX_EXTERNAL_ALLOW_READ`, and it lands in
+ * `allowWrite`, so an absolute-path check alone would hand the sandbox an
+ * arbitrary writable location.
+ */
+export function containedPath(value, { cwd, agentDir }) {
+  if (!value || typeof value !== "string" || !isAbsolute(value)) return undefined;
+  const candidate = resolve(value);
+  const roots = [resolve(cwd), resolve(agentDir)];
+  return roots.some((root) => isWithin(root, candidate)) ? candidate : undefined;
 }
 
 /**
@@ -80,6 +92,7 @@ export function createExternalWorkerPolicy({
 }) {
   const workspace = resolve(cwd);
   const agent = resolve(agentDir);
+  const containedSessionDir = containedPath(sessionDir, { cwd, agentDir });
   const resolvedHome = resolve(home);
 
   // On Linux Sandbox Runtime masks the first missing component of a deny path.
@@ -121,7 +134,7 @@ export function createExternalWorkerPolicy({
         workspace,
         "/dev/null",
         ...(workerTempDir ? [workerTempDir] : []),
-        ...(sessionDir?.startsWith("/") ? [sessionDir] : []),
+        ...(containedSessionDir ? [containedSessionDir] : []),
         // H1: the agent directory is still writable here. Narrowing it needs
         // the set of paths Pi legitimately creates at startup, which is not
         // yet established; the deny entries below are the defense in depth.

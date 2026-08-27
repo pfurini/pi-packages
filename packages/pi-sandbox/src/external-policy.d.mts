@@ -5,6 +5,11 @@ export declare function sanitizeExternalReadPaths(
   roots: { cwd: string; agentDir: string },
 ): string[];
 
+export declare function containedPath(
+  value: string | undefined,
+  roots: { cwd: string; agentDir: string },
+): string | undefined;
+
 export declare function usableRealPiBinary(
   value: string | undefined,
 ): string | undefined;

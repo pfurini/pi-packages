@@ -105,6 +105,54 @@ test("extra read paths reject traversal that escapes the workspace", () => {
   );
 });
 
+test("an out-of-scope sessionDir never becomes a writable sandbox path", () => {
+  // PI_CODING_AGENT_SESSION_DIR is read from the launcher's environment on the
+  // same trust footing as PI_SANDBOX_EXTERNAL_ALLOW_READ, but lands in
+  // allowWrite. An absolute-path check alone would grant an arbitrary writable
+  // path inside the sandbox.
+  const cwd = workspace();
+  const agentDir = join(cwd, "fake-agent");
+  try {
+    for (const hostile of ["/etc", "/", "/home/other/.ssh", `${cwd}/../escape`]) {
+      const allowWrite = createExternalWorkerPolicy({
+        cwd,
+        agentDir,
+        home: join(agentDir, "..", ".."),
+        packageRoot: PACKAGE_ROOT,
+        nodeBinDir: dirname(process.execPath),
+        nodeRoot: "/usr/local",
+        runtimeRoot: "/opt/srt",
+        platform: "linux",
+        sessionDir: hostile,
+        network: { allowedDomains: [], deniedDomains: [] },
+      }).filesystem.allowWrite;
+      assert.ok(
+        !allowWrite.includes(hostile),
+        `sessionDir ${hostile} must not be writable`,
+      );
+    }
+    // A legitimate session dir under the agent directory is still honored.
+    const legit = join(agentDir, "sessions");
+    assert.ok(
+      createExternalWorkerPolicy({
+        cwd,
+        agentDir,
+        home: join(agentDir, "..", ".."),
+        packageRoot: PACKAGE_ROOT,
+        nodeBinDir: dirname(process.execPath),
+        nodeRoot: "/usr/local",
+        runtimeRoot: "/opt/srt",
+        platform: "linux",
+        sessionDir: legit,
+        network: { allowedDomains: [], deniedDomains: [] },
+      }).filesystem.allowWrite.includes(legit),
+      "a session dir under the agent directory must stay writable",
+    );
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 test("the real Pi binary must be an absolute path to an existing file", () => {
   // Deliberately not an identity check against process.execPath: the launcher
   // runs under `#!/usr/bin/env node` while the parent injects its own
