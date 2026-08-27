@@ -28,8 +28,8 @@ jobs:
     name: Pinned suite
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
           cache: npm
@@ -48,8 +48,8 @@ jobs:
     name: Latest pi-subagents drift
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
           cache: npm
@@ -71,44 +71,54 @@ jobs:
       - name: External-isolation contract probe (latest)
         run: npm run gate:external-isolation
 
-  # NOTE: `secrets` cannot be referenced from a job-level `if`. The opt-in is
-  # therefore implemented by importing the secrets into a job-level `env` and
-  # gating each step with `if: env.PI_SUBAGENTS_GATE_MODEL != ''`. When no
-  # model secret is configured, the job prints a skip notice and is green.
+  # Secrets are deliberately NOT declared at job level: a job-level `env:` puts
+  # them in the environment of every step, including `npm ci` and the unpinned
+  # `@latest` installs below, whose lifecycle scripts would then run with the
+  # full provider credential set. Instead a first step reads only the opt-in
+  # flag and publishes a non-secret boolean output; every later step gates on
+  # that output, and the credentials appear only in the final gate step.
   model-gate:
     name: Model-backed compat gate (opt-in)
     runs-on: ubuntu-latest
-    env:
-      PI_SUBAGENTS_GATE_MODEL: ${{ secrets.PI_SUBAGENTS_GATE_MODEL }}
-      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-      ANTHROPIC_AUTH_TOKEN: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
-      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-      CLIPROXYAPI_API_KEY: ${{ secrets.CLIPROXYAPI_API_KEY }}
     steps:
-      - name: Skip unless a model secret is configured
-        if: env.PI_SUBAGENTS_GATE_MODEL == ''
-        run: echo "model-gate skipped (PI_SUBAGENTS_GATE_MODEL not configured)"; exit 0
+      - name: Detect opt-in
+        id: optin
+        env:
+          PI_SUBAGENTS_GATE_MODEL: ${{ secrets.PI_SUBAGENTS_GATE_MODEL }}
+        run: |
+          if [ -n "$PI_SUBAGENTS_GATE_MODEL" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "model-gate skipped (PI_SUBAGENTS_GATE_MODEL not configured)"
+          fi
       - name: Checkout
-        if: env.PI_SUBAGENTS_GATE_MODEL != ''
-        uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        if: env.PI_SUBAGENTS_GATE_MODEL != ''
+        if: steps.optin.outputs.enabled == 'true'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        if: steps.optin.outputs.enabled == 'true'
         with:
           node-version: 22
           cache: npm
       - name: Install tmux + sandbox runtime host dependencies
-        if: env.PI_SUBAGENTS_GATE_MODEL != ''
+        if: steps.optin.outputs.enabled == 'true'
         run: sudo apt-get update && sudo apt-get install -y tmux ripgrep bubblewrap socat
       - run: npm ci
-        if: env.PI_SUBAGENTS_GATE_MODEL != ''
+        if: steps.optin.outputs.enabled == 'true'
       - name: Install latest pi-subagents
-        if: env.PI_SUBAGENTS_GATE_MODEL != ''
+        if: steps.optin.outputs.enabled == 'true'
         run: npm install -D -E pi-subagents@latest --workspace packages/pi-sandbox
       - name: Install pi binary (PI_SUBAGENTS_GATE_PI_BINARY)
-        if: env.PI_SUBAGENTS_GATE_MODEL != ''
+        if: steps.optin.outputs.enabled == 'true'
         run: npm i -g @earendil-works/pi-coding-agent
       - name: Run compatibility gate
-        if: env.PI_SUBAGENTS_GATE_MODEL != ''
+        if: steps.optin.outputs.enabled == 'true'
+        env:
+          PI_SUBAGENTS_GATE_MODEL: ${{ secrets.PI_SUBAGENTS_GATE_MODEL }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_AUTH_TOKEN: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          CLIPROXYAPI_API_KEY: ${{ secrets.CLIPROXYAPI_API_KEY }}
         run: npm run gate:pi-subagents
