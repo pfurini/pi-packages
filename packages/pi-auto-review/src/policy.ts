@@ -370,11 +370,26 @@ export type HardDeny = {
  * the model or the user prompt. Ambiguous or merely high-risk actions belong in
  * the detailed reviewer, which can defer to the human.
  */
+/**
+ * Upper bound on the command text fed to the matchers below.
+ *
+ * The matchers are quadratic, not linear: they scan from every offset, and each
+ * offset re-runs a path-segment star. Measured on the real function, a 4KB
+ * adversarial input costs ~330ms and 16KB ~1.4s of *synchronous* host event-loop
+ * time, which nothing can interrupt. Real commands are far below this cap.
+ *
+ * Beyond the cap the deterministic credential matchers are skipped, and the
+ * request falls through to the model reviewer -- the same backstop that already
+ * carries every credential form these matchers do not enumerate.
+ */
+const MAX_HARD_DENY_COMMAND_BYTES = 16_384;
+
 export function deterministicHardDeny(
   details: PermissionDetailsLike,
 ): HardDeny | undefined {
   const command = effectiveCommand(details)?.trim();
   if (!command) return undefined;
+  if (command.length > MAX_HARD_DENY_COMMAND_BYTES) return undefined;
 
   for (const segment of command.split(/&&|\|\||;|\n/)) {
     const isRm = /(?:^|\s)(?:\/[^\s/]+)*\/?rm(?:\s|$)/i.test(segment);
