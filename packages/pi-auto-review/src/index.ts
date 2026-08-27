@@ -1,7 +1,15 @@
 import { createHash, randomBytes } from "node:crypto";
 import { appendFileSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import {
+  dirname,
+  isAbsolute,
+  join,
+  parse,
+  relative,
+  resolve,
+  sep,
+} from "node:path";
 import { fileURLToPath } from "node:url";
 import type {
   ExtensionAPI,
@@ -633,8 +641,45 @@ function isWithin(parent: string, child: string): boolean {
   return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
 }
 
-function protectedWriteHardDeny(
+/**
+ * Best-effort symlink resolution, matching what `@gotgenes/pi-permission-system`
+ * does for its own containment checks: walk from the full path down to the root
+ * and re-append the tail that does not exist yet. A path that cannot be resolved
+ * (ENOENT everywhere, EACCES, ELOOP) degrades to its lexical form rather than
+ * throwing, so an unresolvable target is still compared, just lexically.
+ */
+function canonicalize(absolutePath: string): string {
+  const { root } = parse(absolutePath);
+  const parts = absolutePath.slice(root.length).split(sep).filter(Boolean);
+  for (let index = parts.length; index >= 0; index--) {
+    try {
+      const real = realpathSync(root + parts.slice(0, index).join(sep));
+      const tail = parts.slice(index);
+      return tail.length === 0 ? real : join(real, ...tail);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT" && code !== "ENOTDIR") return absolutePath;
+    }
+  }
+  return absolutePath;
+}
+
+/**
+ * Terminal deny for writes that would tamper with this extension's own code,
+ * policy, configuration, or audit trail.
+ *
+ * `trustedCwd` must come from the extension context, never from the request:
+ * on the sandbox-runtime surface `request.cwd` is the *traced process's* cwd
+ * (`trap.process.cwd`), so a sandboxed process could shift the workspace-derived
+ * protections off the real workspace simply by changing directory.
+ *
+ * Both the target and the protected paths are canonicalized before comparison.
+ * Resolving only the target would break every match on macOS, where the
+ * workspace commonly lives under a symlinked `/tmp` → `/private/tmp`.
+ */
+export function protectedWriteHardDeny(
   request: BoundaryRequest,
+  trustedCwd: string,
 ): { rule: string; reason: string } | undefined {
   const isWrite =
     request.surface === "filesystem-write" ||
@@ -644,22 +689,22 @@ function protectedWriteHardDeny(
   if (!isWrite) return;
   const target = request.resolvedPath || request.path;
   if (!target) return;
-  const resolvedTarget = resolve(request.cwd, target);
+  const resolvedTarget = canonicalize(resolve(trustedCwd, target));
   const agentDir = join(homedir(), ".pi", "agent");
   const protectedDirectories = [
     PACKAGE_ROOT,
     join(agentDir, "logs"),
     join(agentDir, "extensions", "pi-auto-review"),
-  ];
+  ].map(canonicalize);
   const protectedFiles = [
-    join(request.cwd, ".pi", "settings.json"),
-    join(request.cwd, ".pi", "sandbox.json"),
-    join(request.cwd, PROJECT_CONFIG_PATH),
+    join(trustedCwd, ".pi", "settings.json"),
+    join(trustedCwd, ".pi", "sandbox.json"),
+    join(trustedCwd, PROJECT_CONFIG_PATH),
     join(agentDir, "settings.json"),
     join(agentDir, "permissions.json"),
     join(agentDir, "sandbox.json"),
     userConfigPath(),
-  ];
+  ].map(canonicalize);
   if (
     protectedDirectories.some((path) => isWithin(path, resolvedTarget)) ||
     protectedFiles.includes(resolvedTarget)
@@ -2008,7 +2053,10 @@ export function createPiAutoReviewExtension(
         }
       },
       hardDeny: (request) =>
-        protectedWriteHardDeny(request) ??
+        // The trusted extension cwd, never `request.cwd`, which a sandboxed
+        // process controls via `trap.process.cwd`. Falling back to the request
+        // value keeps behaviour no worse than before if activation raced.
+        protectedWriteHardDeny(request, context?.cwd ?? request.cwd) ??
         deterministicHardDeny({
           surface: "bash_escalated",
           command: request.command,
