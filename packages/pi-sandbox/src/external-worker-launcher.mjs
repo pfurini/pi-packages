@@ -6,11 +6,21 @@ import { createConnection } from "node:net";
 import { randomUUID } from "node:crypto";
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmdirSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { dirname, join, parse, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { decodeExternalNetworkPolicy } from "./external-network-policy.mjs";
+import {
+  createExternalWorkerPolicy,
+  sanitizeExternalReadPaths,
+  usableRealPiBinary,
+} from "./external-policy.mjs";
 
-const realPi = process.env.PI_SANDBOX_EXTERNAL_REAL_PI_BINARY;
+// The wrapper must not treat its own environment as trusted: these variables
+// are visible inside every sandbox. This is a shape/existence check, not proof
+// of identity -- see usableRealPiBinary for exactly what it does not promise.
+const realPi = usableRealPiBinary(
+  process.env.PI_SANDBOX_EXTERNAL_REAL_PI_BINARY,
+);
 const workerId = randomUUID();
 
 function worktreeGitReadPaths(cwd) {
@@ -155,29 +165,14 @@ if (!realPi) {
   const packageRoot = dirname(fileURLToPath(import.meta.url));
   const nodeRoot = dirname(dirname(process.execPath));
   const runtimeRoot = dirname(dirname(fileURLToPath(import.meta.resolve("@anthropic-ai/sandbox-runtime"))));
-  const extraRead = (process.env.PI_SANDBOX_EXTERNAL_ALLOW_READ || "")
-    .split(":")
-    .filter(Boolean);
+  const extraRead = sanitizeExternalReadPaths(
+    process.env.PI_SANDBOX_EXTERNAL_ALLOW_READ,
+    { cwd, agentDir },
+  );
   const existingGitConfig = [
     join(home, ".gitconfig"),
     join(home, ".config", "git", "config"),
   ].filter(existsSync);
-  // On Linux Sandbox Runtime masks the first missing component of a deny path.
-  // Denying a not-yet-created `.pi/settings.json` would therefore mask `.pi`
-  // itself and prevent Pi from creating its ordinary project state directory.
-  // Existing security files remain outer-sandbox protected; creation attempts
-  // are still gated by permission-system and pi-auto-review.
-  const workspaceSecurityFiles = [
-    join(cwd, ".pi", "settings.json"),
-    join(cwd, ".pi", "sandbox.json"),
-    join(cwd, ".pi", "pi-auto-review.json"),
-  ];
-  const agentSecurityPaths = [
-    join(agentDir, "settings.json"),
-    join(agentDir, "permissions.json"),
-    join(agentDir, "sandbox.json"),
-    join(agentDir, "extensions"),
-  ];
   const registration = await registerWorker();
   if (registration.action !== "allow") {
     process.stderr.write("pi-sandbox: external worker registration was denied\n");
@@ -185,38 +180,24 @@ if (!realPi) {
     process.exit();
   }
   const registeredNetwork = decodeExternalNetworkPolicy(registration.network);
-  const runtimeConfig = {
-    filesystem: {
-      denyRead: home === parse(home).root ? [] : [home],
-      allowRead: [cwd, nodeRoot, runtimeRoot, ...existingGitConfig, "/dev/null", ...worktreeGitReadPaths(cwd), ...extraRead],
-      // Child sessions and permission-forwarding request/response files live
-      // here. Keep this narrower than the agent directory, whose security
-      // settings and extensions remain read-only.
-      allowWrite: [
-        cwd,
-        "/dev/null",
-        workerTempDir,
-        ...(sessionDir?.startsWith("/") ? [sessionDir] : []),
-        // Pi creates directory-style settings locks and provider model caches
-        // beside its global settings. Security-sensitive files and extensions
-        // below remain explicit denyWrite entries.
-        agentDir,
-      ],
-      denyWrite: [
-        ...workspaceSecurityFiles,
-        ...agentSecurityPaths,
-        packageRoot,
-        dirname(process.execPath),
-      ],
-      allowGitConfig: true,
-    },
-    network: {
-      allowedDomains: registeredNetwork.allowedDomains,
-      deniedDomains: registeredNetwork.deniedDomains,
-      allowAllUnixSockets: false, allowUnixSockets: [],
-      allowLocalBinding: false,
-    },
-  };
+  // On Linux Sandbox Runtime masks the first missing component of a deny path,
+  // which is why the placeholders above are created before this policy is built.
+  const runtimeConfig = createExternalWorkerPolicy({
+    cwd,
+    agentDir,
+    home,
+    packageRoot,
+    nodeBinDir: dirname(process.execPath),
+    nodeRoot,
+    runtimeRoot,
+    sessionDir,
+    workerTempDir,
+    extraRead,
+    gitReadPaths: worktreeGitReadPaths(cwd),
+    existingGitConfig,
+    network: registeredNetwork,
+  });
+
   const broker = fork(new URL("./srt-broker.mjs", import.meta.url), [], {
     cwd,
     detached: true,
