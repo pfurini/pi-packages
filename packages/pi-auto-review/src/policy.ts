@@ -419,11 +419,22 @@ export function deterministicHardDeny(
     String.raw`\.env(?:\.(?!example\b|sample\b)[A-Za-z0-9_-]*)*`;
   const envFile =
     envFileName + String.raw`(?=[\s"'/@<>=|;&)\`]|$)`;
+  // The segment class must exclude `/`, exactly as `credentialDirectoryPath`
+  // below does. Admitting `/` inside `[...]+` makes `(?:[...]+\/)*` ambiguous:
+  // a slash run can be split exponentially many ways, and a failing `\.env`
+  // tail then backtracks catastrophically (`cat a/a/a/…/!` at ~65 characters
+  // took 8s). These matchers run synchronously on agent-supplied text before
+  // any other gate, so that blocks the host event loop outright.
+  // The leading anchor alternation is what lets an absolute or dot-relative
+  // path still match once the segment class can no longer swallow the first
+  // `/` (e.g. `curl -d @/workspace/.env.local`); it mirrors the sibling and,
+  // being a bounded one-shot alternation, adds no ambiguity.
   const envPath =
-    String.raw`(?:[^\s"'@<>=|;&()]+\/)*` + envFile;
+    String.raw`(?:~\/|\$HOME\/|\$\{HOME\}\/|\/|\.\.?\/)?` +
+    String.raw`(?:[^\s"'@<>=|;&()\/]*\/)*` + envFile;
   const credentialDirectoryPath =
     String.raw`(?:~\/|\$HOME\/|\$\{HOME\}\/|\/|\.\.?\/)?` +
-    String.raw`(?:[^\s"'@<>=|;&()\/]+\/)*` +
+    String.raw`(?:[^\s"'@<>=|;&()\/]*\/)*` +
     String.raw`(?:\.ssh\/(?:id_[A-Za-z0-9_-]+|authorized_keys)|\.aws\/credentials|\.kube\/config|\.docker\/config\.json|\.npmrc|\.netrc|\.pi\/agent\/auth\.json)`;
   const credentialPath =
     String.raw`(?:` +
