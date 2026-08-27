@@ -1,4 +1,3 @@
-import { readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import {
   dirname,
@@ -11,6 +10,7 @@ import {
 import { fileURLToPath } from "node:url";
 import type { SandboxRuntimeConfig } from "@anthropic-ai/sandbox-runtime";
 import type { NetworkConfig } from "./config.ts";
+import { createWorkspaceSecretDenyWritePaths } from "./workspace-secrets.mjs";
 
 const PACKAGE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const NODE_INSTALL_ROOT = dirname(dirname(process.execPath));
@@ -20,87 +20,14 @@ const SANDBOX_RUNTIME_ROOT = dirname(
   ),
 );
 
-/** Common secret basenames always denied at the workspace root (even if missing). */
-export const WORKSPACE_SECRET_DENY_WRITE_BASENAMES = [
-  ".env",
-  ".env.local",
-  ".env.development",
-  ".env.development.local",
-  ".env.test",
-  ".env.test.local",
-  ".env.production",
-  ".env.production.local",
-  ".env.staging",
-  ".env.staging.local",
-  ".env.ci",
-] as const;
-
-/** Secret-like directories denied at the workspace root (even if missing). */
-export const WORKSPACE_SECRET_DENY_WRITE_DIRECTORIES = [
-  "secrets",
-  ".secrets",
-] as const;
-
-/** Private-key / certificate extensions denied when discovered under the workspace. */
-export const WORKSPACE_SECRET_DENY_WRITE_EXTENSIONS = [
-  ".pem",
-  ".key",
-  ".p12",
-  ".pfx",
-] as const;
-
-/**
- * Template / sample env files that agents may legitimately create or edit.
- * These are excluded from secret write denials.
- */
-export const WORKSPACE_SECRET_TEMPLATE_BASENAMES = new Set([
-  ".env.example",
-  ".env.sample",
-  ".env.template",
-  ".env.dist",
-]);
-
-const WALK_SKIP_DIRECTORIES = new Set([
-  ".git",
-  "node_modules",
-  "dist",
-  "build",
-  "coverage",
-  ".next",
-  ".turbo",
-  ".cache",
-  "target",
-  "vendor",
-]);
-
-/** Bounded workspace walk used to discover nested secrets on every platform. */
-const WORKSPACE_SECRET_SCAN_MAX_DEPTH = 4;
-
-/**
- * macOS Seatbelt supports git-style globs; Linux bubblewrap silently drops them.
- * Keep these as an extra nested-create defense on Darwin only.
- */
-const DARWIN_SECRET_DENY_WRITE_GLOBS = [
-  "**/.env",
-  "**/.env.local",
-  "**/.env.development",
-  "**/.env.development.local",
-  "**/.env.test",
-  "**/.env.test.local",
-  "**/.env.production",
-  "**/.env.production.local",
-  "**/.env.staging",
-  "**/.env.staging.local",
-  "**/.env.ci",
-  "**/secrets",
-  "**/secrets/**",
-  "**/.secrets",
-  "**/.secrets/**",
-  "**/*.pem",
-  "**/*.key",
-  "**/*.p12",
-  "**/*.pfx",
-] as const;
+export {
+  WORKSPACE_SECRET_DENY_WRITE_BASENAMES,
+  WORKSPACE_SECRET_DENY_WRITE_DIRECTORIES,
+  WORKSPACE_SECRET_DENY_WRITE_EXTENSIONS,
+  WORKSPACE_SECRET_TEMPLATE_BASENAMES,
+  createWorkspaceSecretDenyWritePaths,
+  isSecretDenyWriteBasename,
+} from "./workspace-secrets.mjs";
 
 export type SandboxPolicy = {
   filesystem: {
@@ -123,104 +50,6 @@ export type CreateDefaultPolicyOptions = {
   additionalAllowRead?: readonly string[];
   network?: NetworkConfig;
 };
-
-export function isSecretDenyWriteBasename(name: string): boolean {
-  if (WORKSPACE_SECRET_TEMPLATE_BASENAMES.has(name)) {
-    return false;
-  }
-  if (
-    (WORKSPACE_SECRET_DENY_WRITE_BASENAMES as readonly string[]).includes(name)
-  ) {
-    return true;
-  }
-  // Catch less common variants such as `.env.preview` while sparing templates.
-  if (name.startsWith(".env.")) {
-    return true;
-  }
-  const lower = name.toLowerCase();
-  return WORKSPACE_SECRET_DENY_WRITE_EXTENSIONS.some((extension) =>
-    lower.endsWith(extension),
-  );
-}
-
-function collectNestedSecretDenyWritePaths(
-  workspace: string,
-  maxDepth = WORKSPACE_SECRET_SCAN_MAX_DEPTH,
-): string[] {
-  const discovered: string[] = [];
-
-  const visit = (directory: string, depth: number): void => {
-    if (depth > maxDepth) {
-      return;
-    }
-    let entries;
-    try {
-      entries = readdirSync(directory, { withFileTypes: true });
-    } catch {
-      return;
-    }
-    for (const entry of entries) {
-      if (entry.name === "." || entry.name === "..") {
-        continue;
-      }
-      const fullPath = join(directory, entry.name);
-      if (entry.isDirectory()) {
-        if (WALK_SKIP_DIRECTORIES.has(entry.name)) {
-          continue;
-        }
-        if (
-          (WORKSPACE_SECRET_DENY_WRITE_DIRECTORIES as readonly string[]).includes(
-            entry.name,
-          )
-        ) {
-          discovered.push(fullPath);
-          continue;
-        }
-        visit(fullPath, depth + 1);
-        continue;
-      }
-      if (entry.isFile() && isSecretDenyWriteBasename(entry.name)) {
-        discovered.push(fullPath);
-      }
-    }
-  };
-
-  visit(workspace, 0);
-  return discovered;
-}
-
-/**
- * Build workspace secret write denials.
- *
- * - Always includes root-level secret basenames/directories as absolute paths so
- *   Linux can block both existing files and first-time creation.
- * - Scans a shallow workspace tree for nested secrets that already exist.
- * - Adds Darwin-only globs so nested creates are also blocked on macOS.
- */
-export function createWorkspaceSecretDenyWritePaths(
-  workspace: string,
-  platform: NodeJS.Platform = process.platform,
-): string[] {
-  const root = resolve(workspace);
-  const paths = new Set<string>();
-
-  for (const name of WORKSPACE_SECRET_DENY_WRITE_BASENAMES) {
-    paths.add(join(root, name));
-  }
-  for (const name of WORKSPACE_SECRET_DENY_WRITE_DIRECTORIES) {
-    paths.add(join(root, name));
-  }
-  for (const discovered of collectNestedSecretDenyWritePaths(root)) {
-    paths.add(discovered);
-  }
-  if (platform === "darwin") {
-    for (const pattern of DARWIN_SECRET_DENY_WRITE_GLOBS) {
-      paths.add(pattern);
-    }
-  }
-
-  return [...paths];
-}
 
 export function createDefaultPolicy(
   cwd: string,
