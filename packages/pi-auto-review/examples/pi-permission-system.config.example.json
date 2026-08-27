@@ -164,8 +164,8 @@
     },
     "ask_user": "allow",
     "todo": "allow",
-    "web_search": "allow",
-    "get_search_content": "allow",
+    "web_search": "ask",
+    "get_search_content": "ask",
     "fetch_content": "ask"
   }
 }
