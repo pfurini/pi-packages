@@ -649,6 +649,12 @@ function isWithin(parent: string, child: string): boolean {
 /** Bound on followed symlink hops, so a cycle terminates instead of hanging. */
 const MAX_SYMLINK_HOPS = 12;
 
+type CanonicalPath = {
+  path: string;
+  /** The hop budget ran out while the path was still a symlink. */
+  exhausted: boolean;
+};
+
 /**
  * Best-effort symlink resolution for containment comparisons: walk from the
  * full path down to the root, then re-append the tail that does not exist yet.
@@ -661,8 +667,12 @@ const MAX_SYMLINK_HOPS = 12;
  * its target, so a link pointing at a not-yet-existing protected file is a live
  * tampering path. Follow the first unresolved component explicitly when it is a
  * symlink, and recurse on the target.
+ *
+ * `exhausted` reports that the budget ran out with a symlink still in hand. The
+ * kernel does not share our budget -- it follows the whole chain on write -- so
+ * the caller must fail closed rather than compare a path we know is wrong.
  */
-function canonicalize(absolutePath: string, hops = 0): string {
+function canonicalize(absolutePath: string, hops = 0): CanonicalPath {
   const { root } = parse(absolutePath);
   const parts = absolutePath.slice(root.length).split(sep).filter(Boolean);
   for (let index = parts.length; index >= 0; index--) {
@@ -671,27 +681,37 @@ function canonicalize(absolutePath: string, hops = 0): string {
       real = realpathSync(root + parts.slice(0, index).join(sep));
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
-      if (code !== "ENOENT" && code !== "ENOTDIR") return absolutePath;
+      // ELOOP: the kernel hit its own symlink limit, so the path is still
+      // symlinked and unresolvable -- the same fail-closed case as running out
+      // of our hop budget, just discovered by the OS first.
+      if (code === "ELOOP") return { path: absolutePath, exhausted: true };
+      if (code !== "ENOENT" && code !== "ENOTDIR") {
+        return { path: absolutePath, exhausted: false };
+      }
       continue;
     }
     const tail = parts.slice(index);
-    if (tail.length === 0) return real;
+    if (tail.length === 0) return { path: real, exhausted: false };
     const unresolved = join(real, tail[0]);
-    if (hops < MAX_SYMLINK_HOPS) {
-      try {
-        // Throws EINVAL when it is not a symlink, ENOENT when nothing is there.
-        const target = readlinkSync(unresolved);
-        return canonicalize(
-          join(resolve(dirname(unresolved), target), ...tail.slice(1)),
-          hops + 1,
-        );
-      } catch {
-        // Not a symlink, or unreadable: fall through to the lexical join.
-      }
+    let target: string | undefined;
+    try {
+      // Throws EINVAL when it is not a symlink, ENOENT when nothing is there.
+      target = readlinkSync(unresolved);
+    } catch {
+      // Not a symlink, or unreadable: the lexical join is the honest answer.
     }
-    return join(real, ...tail);
+    if (target === undefined) {
+      return { path: join(real, ...tail), exhausted: false };
+    }
+    if (hops >= MAX_SYMLINK_HOPS) {
+      return { path: join(real, ...tail), exhausted: true };
+    }
+    return canonicalize(
+      join(resolve(dirname(unresolved), target), ...tail.slice(1)),
+      hops + 1,
+    );
   }
-  return absolutePath;
+  return { path: absolutePath, exhausted: false };
 }
 
 /**
@@ -701,7 +721,9 @@ function canonicalize(absolutePath: string, hops = 0): string {
  * `trustedCwd` must come from the extension context, never from the request:
  * on the sandbox-runtime surface `request.cwd` is the *traced process's* cwd
  * (`trap.process.cwd`), so a sandboxed process could shift the workspace-derived
- * protections off the real workspace simply by changing directory.
+ * protections off the real workspace simply by changing directory. When no
+ * trusted cwd is available the workspace-derived entries are dropped rather
+ * than rebuilt from the request; the home-derived protections still apply.
  *
  * Both the target and the protected paths are canonicalized before comparison.
  * Resolving only the target would break every match on macOS, where the
@@ -709,7 +731,7 @@ function canonicalize(absolutePath: string, hops = 0): string {
  */
 export function protectedWriteHardDeny(
   request: BoundaryRequest,
-  trustedCwd: string,
+  trustedCwd: string | undefined,
 ): { rule: string; reason: string } | undefined {
   const isWrite =
     request.surface === "filesystem-write" ||
@@ -719,25 +741,38 @@ export function protectedWriteHardDeny(
   if (!isWrite) return;
   const target = request.resolvedPath || request.path;
   if (!target) return;
-  const resolvedTarget = canonicalize(resolve(trustedCwd, target));
+  const resolvedTarget = canonicalize(
+    trustedCwd ? resolve(trustedCwd, target) : resolve(target),
+  );
+  if (resolvedTarget.exhausted) {
+    return {
+      rule: "unresolvable-symlink-chain",
+      reason:
+        "the write target is a symlink chain too deep to resolve, so it cannot be shown to stay outside protected paths",
+    };
+  }
   const agentDir = join(homedir(), ".pi", "agent");
   const protectedDirectories = [
     PACKAGE_ROOT,
     join(agentDir, "logs"),
     join(agentDir, "extensions", "pi-auto-review"),
-  ].map(canonicalize);
+  ].map((path) => canonicalize(path).path);
   const protectedFiles = [
-    join(trustedCwd, ".pi", "settings.json"),
-    join(trustedCwd, ".pi", "sandbox.json"),
-    join(trustedCwd, PROJECT_CONFIG_PATH),
+    ...(trustedCwd
+      ? [
+          join(trustedCwd, ".pi", "settings.json"),
+          join(trustedCwd, ".pi", "sandbox.json"),
+          join(trustedCwd, PROJECT_CONFIG_PATH),
+        ]
+      : []),
     join(agentDir, "settings.json"),
     join(agentDir, "permissions.json"),
     join(agentDir, "sandbox.json"),
     userConfigPath(),
-  ].map(canonicalize);
+  ].map((path) => canonicalize(path).path);
   if (
-    protectedDirectories.some((path) => isWithin(path, resolvedTarget)) ||
-    protectedFiles.includes(resolvedTarget)
+    protectedDirectories.some((path) => isWithin(path, resolvedTarget.path)) ||
+    protectedFiles.includes(resolvedTarget.path)
   ) {
     return {
       rule: "security-control-tampering",
@@ -2084,9 +2119,10 @@ export function createPiAutoReviewExtension(
       },
       hardDeny: (request) =>
         // The trusted extension cwd, never `request.cwd`, which a sandboxed
-        // process controls via `trap.process.cwd`. Falling back to the request
-        // value keeps behaviour no worse than before if activation raced.
-        protectedWriteHardDeny(request, context?.cwd ?? request.cwd) ??
+        // process controls via `trap.process.cwd`. Undefined drops the
+        // workspace-derived protections rather than rebuilding them from an
+        // attacker-supplied value; home-derived ones still apply.
+        protectedWriteHardDeny(request, context?.cwd) ??
         deterministicHardDeny({
           surface: "bash_escalated",
           command: request.command,

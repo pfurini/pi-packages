@@ -119,21 +119,76 @@ test("a dangling symlink with a deeper missing tail is hard-denied", () => {
   }
 });
 
-test("a symlink cycle terminates instead of hanging", () => {
+test("a symlink cycle terminates and fails closed", () => {
   const cwd = workspace();
   try {
     symlinkSync(join(cwd, "b"), join(cwd, "a"));
     symlinkSync(join(cwd, "a"), join(cwd, "b"));
-    // Must return, not loop; the value itself is not protected.
+    // Must terminate rather than loop, and must deny: a cycle is unresolvable,
+    // so we cannot show the target stays outside protected paths.
     assert.equal(
       protectedWriteHardDeny(
         { id: "d3", source: "permission-system", surface: "filesystem-write", operation: "write", cwd, resolvedPath: join(cwd, "a") },
         cwd,
-      ),
-      undefined,
+      )?.rule,
+      "unresolvable-symlink-chain",
     );
   } finally {
     rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("a symlink chain longer than the hop budget fails CLOSED", () => {
+  // The hop bound stops runaway recursion, but returning the lexical path at
+  // exhaustion fails OPEN: the kernel still follows the whole chain on write,
+  // so a 13-deep chain reached protected space unblocked.
+  const cwd = workspace();
+  try {
+    const depth = 40;
+    for (let i = 0; i < depth; i++) {
+      symlinkSync(
+        i === depth - 1
+          ? join(PACKAGE_ROOT, "src", "__missing__.ts")
+          : join(cwd, `l${i + 1}`),
+        join(cwd, `l${i}`),
+      );
+    }
+    assert.ok(
+      protectedWriteHardDeny(
+        { id: "h1", source: "permission-system", surface: "filesystem-write", operation: "write", cwd, resolvedPath: join(cwd, "l0") },
+        cwd,
+      ),
+      "a chain past the hop budget must be denied, not allowed",
+    );
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("an unavailable trusted cwd does not fall back to the request's cwd", () => {
+  // The old `context?.cwd ?? request.cwd` fallback reinstated the exact
+  // weakness this function exists to close. Home-derived protections must
+  // still apply when no trusted cwd is available.
+  const attacker = workspace();
+  try {
+    assert.equal(
+      protectedWriteHardDeny(
+        { id: "u1", source: "sandbox-runtime", surface: "filesystem-write", operation: "write", cwd: attacker, resolvedPath: join(attacker, ".pi", "settings.json") },
+        undefined,
+      ),
+      undefined,
+      "an attacker-claimed cwd must not define the protected set",
+    );
+    assert.equal(
+      protectedWriteHardDeny(
+        { id: "u2", source: "sandbox-runtime", surface: "filesystem-write", operation: "write", cwd: attacker, resolvedPath: join(PACKAGE_ROOT, "src", "index.ts") },
+        undefined,
+      )?.rule,
+      "security-control-tampering",
+      "home-derived protections must still apply without a trusted cwd",
+    );
+  } finally {
+    rmSync(attacker, { recursive: true, force: true });
   }
 });
 
