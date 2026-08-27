@@ -1,5 +1,10 @@
 import { createHash, randomBytes } from "node:crypto";
-import { appendFileSync, readFileSync, realpathSync } from "node:fs";
+import {
+  appendFileSync,
+  readFileSync,
+  readlinkSync,
+  realpathSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import {
   dirname,
@@ -641,25 +646,50 @@ function isWithin(parent: string, child: string): boolean {
   return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
 }
 
+/** Bound on followed symlink hops, so a cycle terminates instead of hanging. */
+const MAX_SYMLINK_HOPS = 12;
+
 /**
- * Best-effort symlink resolution, matching what `@gotgenes/pi-permission-system`
- * does for its own containment checks: walk from the full path down to the root
- * and re-append the tail that does not exist yet. A path that cannot be resolved
- * (ENOENT everywhere, EACCES, ELOOP) degrades to its lexical form rather than
- * throwing, so an unresolvable target is still compared, just lexically.
+ * Best-effort symlink resolution for containment comparisons: walk from the
+ * full path down to the root, then re-append the tail that does not exist yet.
+ * A path that cannot be resolved at all (EACCES, ELOOP) degrades to its lexical
+ * form rather than throwing.
+ *
+ * `realpathSync` throws ENOENT on a *dangling* symlink, so the walk alone stops
+ * at the link's parent and hands back the link's own path, never following it.
+ * That is not a safe answer here: writing through a dangling symlink creates
+ * its target, so a link pointing at a not-yet-existing protected file is a live
+ * tampering path. Follow the first unresolved component explicitly when it is a
+ * symlink, and recurse on the target.
  */
-function canonicalize(absolutePath: string): string {
+function canonicalize(absolutePath: string, hops = 0): string {
   const { root } = parse(absolutePath);
   const parts = absolutePath.slice(root.length).split(sep).filter(Boolean);
   for (let index = parts.length; index >= 0; index--) {
+    let real: string;
     try {
-      const real = realpathSync(root + parts.slice(0, index).join(sep));
-      const tail = parts.slice(index);
-      return tail.length === 0 ? real : join(real, ...tail);
+      real = realpathSync(root + parts.slice(0, index).join(sep));
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
       if (code !== "ENOENT" && code !== "ENOTDIR") return absolutePath;
+      continue;
     }
+    const tail = parts.slice(index);
+    if (tail.length === 0) return real;
+    const unresolved = join(real, tail[0]);
+    if (hops < MAX_SYMLINK_HOPS) {
+      try {
+        // Throws EINVAL when it is not a symlink, ENOENT when nothing is there.
+        const target = readlinkSync(unresolved);
+        return canonicalize(
+          join(resolve(dirname(unresolved), target), ...tail.slice(1)),
+          hops + 1,
+        );
+      } catch {
+        // Not a symlink, or unreadable: fall through to the lexical join.
+      }
+    }
+    return join(real, ...tail);
   }
   return absolutePath;
 }

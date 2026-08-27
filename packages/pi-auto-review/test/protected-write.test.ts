@@ -81,6 +81,62 @@ test("workspace protections follow the trusted cwd, not the request's claimed cw
   }
 });
 
+test("a DANGLING symlink into protected space is hard-denied", () => {
+  // realpathSync throws ENOENT on a dangling link, so a naive canonicalize
+  // stops at the link's parent and hands back the link's own path -- never
+  // following it. Writing through a dangling link CREATES its target, so this
+  // is a live tampering path, not a theoretical one.
+  const cwd = workspace();
+  try {
+    const link = join(cwd, "innocent.ts");
+    symlinkSync(join(PACKAGE_ROOT, "src", "__does_not_exist__.ts"), link);
+    assert.equal(
+      protectedWriteHardDeny(
+        { id: "d1", source: "permission-system", surface: "filesystem-write", operation: "write", cwd, resolvedPath: link },
+        cwd,
+      )?.rule,
+      "security-control-tampering",
+    );
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("a dangling symlink with a deeper missing tail is hard-denied", () => {
+  const cwd = workspace();
+  try {
+    const link = join(cwd, "srcdir");
+    symlinkSync(join(PACKAGE_ROOT, "src", "__missing_dir__"), link);
+    assert.equal(
+      protectedWriteHardDeny(
+        { id: "d2", source: "permission-system", surface: "filesystem-write", operation: "write", cwd, resolvedPath: join(link, "nested", "evil.ts") },
+        cwd,
+      )?.rule,
+      "security-control-tampering",
+    );
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("a symlink cycle terminates instead of hanging", () => {
+  const cwd = workspace();
+  try {
+    symlinkSync(join(cwd, "b"), join(cwd, "a"));
+    symlinkSync(join(cwd, "a"), join(cwd, "b"));
+    // Must return, not loop; the value itself is not protected.
+    assert.equal(
+      protectedWriteHardDeny(
+        { id: "d3", source: "permission-system", surface: "filesystem-write", operation: "write", cwd, resolvedPath: join(cwd, "a") },
+        cwd,
+      ),
+      undefined,
+    );
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 test("ordinary workspace writes stay allowed", () => {
   const cwd = workspace();
   try {
