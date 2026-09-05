@@ -16,8 +16,12 @@
     "*": "ask",
     "external_directory": {
       "*": "ask",
-      "/tmp/*": "allow",
-      "~/.agents/skills/*": "allow"
+      "/tmp": "allow",
+      "/tmp/*": "allow"
+    },
+    "external_directory_read": {
+      "~/.agents/skills/*": "allow",
+      "~/.pi/agent/skills/*": "allow"
     },
     "path": {
       "*": "allow",
@@ -139,6 +143,7 @@
       "wc *": "allow",
       "grep *": "allow",
       "rg *": "allow",
+      "sed -n *": "allow",
       "jq *": "allow",
       "cut *": "allow",
       "tr *": "allow",
@@ -164,8 +169,10 @@
     },
     "ask_user": "allow",
     "todo": "allow",
-    "web_search": "ask",
-    "get_search_content": "ask",
-    "fetch_content": "ask"
+    "web_search": "allow",
+    "get_search_content": "allow",
+    "fetch_content": "ask",
+    "plan_mode_question": "allow",
+    "plan_mode_complete": "allow"
   }
 }

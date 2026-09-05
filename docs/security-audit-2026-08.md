@@ -454,3 +454,36 @@ Verified by execution on Node 26.7.0: file modes under hostile umask, symlink be
 
 **Where this may be wrong:** the ReDoS refutation is an absence of a witness, not a proof — and M4 is precisely the case where hand-inspection and a passing harness both returned the wrong answer. The cheap mitigation is to cap the command length fed to `classifyPermission`, mirroring the existing `MAX_HARD_DENY_COMMAND_BYTES` cap. U2's severity assumes H1 is the only way to plant files in the audit directory; another local write primitive would widen it.
 
+
+## Upstream merge (2026-09-05) — v0.16.0 supersessions
+
+Merging upstream `main` (`ed4ffc0`, pi-auto-review and pi-sandbox 0.16.0) into `personal` voided part of the record above. This section states what the merge changed. The historical passes stay as written.
+
+### The external-worker path is gone
+
+Upstream `fcf4cf9` deletes the external worker architecture and replaces it with a native-background tool boundary in `packages/pi-sandbox/src/pi-subagents-native.ts`. `packages/pi-sandbox/src/config.ts:141` now rejects `subagents.externalWorkerIsolation` with a migration error, so no configuration reaches the old path.
+
+The merge removes `external-worker-launcher.mjs`, `external-supervisor.ts`, `external-runs-view.ts`, `external-network-policy.mjs`, and `scripts/external-isolation-probe.mts` from upstream, plus this branch's `external-policy.mjs`, `external-policy.d.mts`, and `test/external-policy.test.ts`.
+
+| Finding | Status after the merge |
+|---|---|
+| L1 | Moot. `external-supervisor.ts` no longer exists. |
+| L6 | Retired. `createExternalWorkerPolicy` and its six tests are deleted with the launcher they protected. |
+| L7 | Retired. The two sanitized environment variables no longer reach any code. |
+| F6 | Moot. `createMandatoryDenyPlaceholders` lived in the launcher and no longer exists; the `denyWrite` entries it failed to seed remain at `packages/pi-sandbox/src/policy.ts:86-87`. |
+| H2 | Still open, minus one citation. `runner.ts` and `subagent.ts` still forward the host environment; the launcher line and the `PI_SANDBOX_EXTERNAL_SUPERVISOR_*` variables are void. |
+| M3 | Still open as written. It concerns `createDefaultPolicy`, which survives; only the launcher's absent copy of the control is moot. |
+
+`workspace-secrets.mjs` and `workspace-secrets.d.mts` survive the merge. `packages/pi-sandbox/src/policy.ts` still imports and re-exports them, so the workspace secret denials are unaffected.
+
+### U1 is reverted to upstream
+
+The merge takes upstream's `examples/pi-permission-system.config.example.json` verbatim. `web_search` and `get_search_content` return to `"allow"`, `plan_mode_question` and `plan_mode_complete` arrive as `"allow"`, and `fetch_content` stays `"ask"`.
+
+The U1 analysis above still describes the risk accurately. The divergence was dropped to keep this file identical to upstream. Anyone copying the example inherits upstream's egress defaults, so set both tools back to `"ask"` locally to keep the prompt.
+
+### CI statements that no longer resolve
+
+The `gate:external-isolation` script and the `latest-compat` job are deleted. The pinned suite now runs `npm run gate:pi-subagents`, and nothing tests `pi-subagents@latest`. Every statement above that names either one describes CI as it stood in August.
+
+M5 survives intact. `.github/workflows/compat-latest.yml` still scopes provider secrets to the gate step, gates every step on `steps.optin.outputs.enabled`, and pins each action to a commit SHA. `packages/pi-sandbox/test/workflow-hardening.test.ts` still enforces all three properties.

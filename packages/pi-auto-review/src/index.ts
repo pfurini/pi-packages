@@ -85,6 +85,7 @@ import {
   type PolicyAuditArguments,
   type PolicyAuditConfig,
 } from "./policy-audit/index.ts";
+import { isPathSurface, pathSurfaceInfo } from "./path-surfaces.ts";
 export { parseHostPort };
 
 type ReasoningLevel =
@@ -190,7 +191,7 @@ type ReviewAttemptObservation = {
 type PreflightPart = { characters: number; estimatedTokens: number };
 
 type ReviewPreflight = {
-  estimator: "conservative:utf8";
+  estimator: "conservative:cjk-aware";
   maxReviewerInputTokens: number;
   framingReserveTokens: number;
   fixedPrompt: PreflightPart;
@@ -794,6 +795,7 @@ export function protectedWriteHardDeny(
 ): { rule: string; reason: string } | undefined {
   const isWrite =
     request.surface === "filesystem-write" ||
+    pathSurfaceInfo(request.surface)?.effect === "write" ||
     /\b(?:write|create|delete|rename|chmod|chown)\b/i.test(
       request.operation,
     );
@@ -883,7 +885,7 @@ function sessionConfig(
 }
 
 function boundedRequest(surface: string): boolean {
-  return BOUNDED_SURFACES.has(surface);
+  return isPathSurface(surface);
 }
 
 type PermissionsService = {
@@ -906,7 +908,7 @@ function boundaryRequest(
   const surface = evidence.surface;
   const value =
     evidence.resolvedPath ??
-    (surface === "path" || surface === "external_directory"
+    (isPathSurface(surface)
       ? evidence.path
       : evidence.command ?? evidence.value ?? evidence.destination) ??
     details.skillName ??
@@ -1006,10 +1008,51 @@ function sharedReviewContext(
   });
 }
 
+/**
+ * Conservative token estimate for reviewer prompt sizing.
+ *
+ * CJK code points are estimated at one token each: UTF-8 encodes them as
+ * three bytes, so the previous byte-for-token estimator overestimated
+ * CJK-heavy review payloads ~3x and synchronously failed the input-budget
+ * preflight ("reviewer_input_budget_exceeded") for large CJK tool inputs
+ * such as long Chinese plan documents — before the reviewer model was ever
+ * called. Remaining code points are estimated from their UTF-8 byte length
+ * at 3 bytes per token, slightly conservative for ASCII (typical tokenizers
+ * average ~4 bytes per token) and safely conservative for 2-4 byte scripts.
+ */
+const OTHER_BYTES_PER_TOKEN = 3;
+
+function codePointUtf8Bytes(code: number): number {
+  return code < 0x80 ? 1 : code < 0x800 ? 2 : code < 0x10000 ? 3 : 4;
+}
+
+function isCjkCodePoint(code: number): boolean {
+  return (
+    (code >= 0x3000 && code <= 0x9fff) || // CJK symbols, punctuation, ideographs
+    (code >= 0x3400 && code <= 0x4dbf) || // CJK extension A
+    (code >= 0xf900 && code <= 0xfaff) || // CJK compatibility ideographs
+    (code >= 0xac00 && code <= 0xd7af) || // Hangul syllables
+    (code >= 0x3040 && code <= 0x30ff) || // Hiragana + Katakana
+    (code >= 0xff00 && code <= 0xffef) // fullwidth/halfwidth forms
+  );
+}
+
+/** Exported for tests; see the estimator doc comment above. */
+export function estimateReviewerTokens(text: string): number {
+  let tokens = 0;
+  for (const char of text) {
+    const code = char.codePointAt(0) ?? 0;
+    tokens += isCjkCodePoint(code)
+      ? 1
+      : codePointUtf8Bytes(code) / OTHER_BYTES_PER_TOKEN;
+  }
+  return Math.ceil(tokens);
+}
+
 function preflightPart(text: string): PreflightPart {
   return {
     characters: text.length,
-    estimatedTokens: Buffer.byteLength(text, "utf8"),
+    estimatedTokens: estimateReviewerTokens(text),
   };
 }
 
@@ -1018,7 +1061,7 @@ function combinedPreflightPart(values: readonly string[]): PreflightPart {
     (total, value) => ({
       characters: total.characters + value.length,
       estimatedTokens:
-        total.estimatedTokens + Buffer.byteLength(value, "utf8"),
+        total.estimatedTokens + estimateReviewerTokens(value),
     }),
     { characters: 0, estimatedTokens: 0 },
   );
@@ -1074,7 +1117,7 @@ function reviewPreflight(
       REVIEWER_FRAMING_RESERVE_TOKENS,
   };
   return {
-    estimator: "conservative:utf8",
+    estimator: "conservative:cjk-aware",
     maxReviewerInputTokens,
     framingReserveTokens: REVIEWER_FRAMING_RESERVE_TOKENS,
     fixedPrompt,
@@ -1597,7 +1640,7 @@ function noModelSummary(): ReviewExecutionSummary {
       compactionState: "none",
     },
     preflight: {
-      estimator: "conservative:utf8",
+      estimator: "conservative:cjk-aware",
       maxReviewerInputTokens: DEFAULT_CONFIG.maxReviewerInputTokens,
       framingReserveTokens: REVIEWER_FRAMING_RESERVE_TOKENS,
       fixedPrompt: zero,
@@ -1834,7 +1877,12 @@ async function complete(
   });
 
   try {
-    if (transcript.failureCode) {
+    // A budget preflight failure is a sizing estimate, not a safety verdict.
+    // When a human explicitly authorized this exact retry, their decision
+    // must not be vetoed by an estimator: proceed with the truncated
+    // evidence and let the reviewer see the override. The failureCode stays
+    // on the transcript for observability.
+    if (transcript.failureCode && !reviewerContext?.userOverride) {
       incrementError(errorCounts, transcript.failureCode);
       throw new ReviewExecutionError(
         transcript.failureCode,
@@ -2072,6 +2120,69 @@ export type PiAutoReviewExtensionOptions = {
 
 const POLICY_AUDIT_ENTRY_TYPE = "pi-auto-review-policy-audit";
 
+// Headings flagged for "this is actionable" emphasis. The visual weight
+// otherwise matches the rest of the report and a user skimming the TUI can
+// miss the two sections that actually drive decisions.
+const EMPHASIS_HEADINGS = new Set([
+  "Suggested allow rules",
+  "Keep ask",
+]);
+
+function wrapWidth(text: string, width: number): string[] {
+  if (width <= 0) return [text];
+  const lines: string[] = [];
+  for (const paragraph of text.split("\n")) {
+    if (paragraph.length === 0) {
+      lines.push("");
+      continue;
+    }
+    const tokens = paragraph.split(/(\s+)/);
+    let current = "";
+    let currentWidth = 0;
+    const flush = () => {
+      lines.push(current);
+      current = "";
+      currentWidth = 0;
+    };
+    for (const token of tokens) {
+      if (token.length === 0) continue;
+      const tokenWidth = [...token].reduce(
+        (sum, ch) => sum + ((ch.codePointAt(0) ?? 0) > 0xff ? 2 : 1),
+        0,
+      );
+      if (tokenWidth > width) {
+        if (current.length > 0) flush();
+        for (const char of token) {
+          const charWidth = (char.codePointAt(0) ?? 0) > 0xff ? 2 : 1;
+          if (currentWidth + charWidth > width) flush();
+          current += char;
+          currentWidth += charWidth;
+        }
+        continue;
+      }
+      if (currentWidth + tokenWidth > width && current.length > 0) flush();
+      current += token;
+      currentWidth += tokenWidth;
+    }
+    if (current.length > 0) flush();
+  }
+  return lines.length > 0 ? lines : [""];
+}
+
+function styleAuditLine(theme: { fg(color: string, text: string): string }, line: string): string {
+  if (line.length === 0) return line;
+  if (line.startsWith("```")) return theme.fg("mdCodeBlockBorder", line);
+  if (line.startsWith("# ")) return theme.fg("mdHeading", line);
+  if (line.startsWith("## ")) {
+    const title = line.slice(3).trim();
+    return theme.fg(EMPHASIS_HEADINGS.has(title) ? "success" : "mdHeading", line);
+  }
+  // JSON payload inside the config code block — color it so it reads as a
+  // config block, not a paragraph the user is expected to read.
+  if (/^[ {]/.test(line) || /^["}{,]/.test(line)) return theme.fg("mdCodeBlock", line);
+  return theme.fg("muted", line);
+}
+
 function renderPolicyAuditEntry(
   entry: { data?: unknown },
   _options: unknown,
@@ -2085,13 +2196,7 @@ function renderPolicyAuditEntry(
   return {
     render(width: number) {
       const max = Math.max(20, width - 2);
-      return markdown.split("\n").flatMap((line) => {
-        const output: string[] = [];
-        for (let offset = 0; offset < Math.max(1, line.length); offset += max) {
-          output.push(theme.fg("muted", line.slice(offset, offset + max)));
-        }
-        return output;
-      });
+      return markdown.split("\n").flatMap((line) => wrapWidth(line, max).map((visual) => styleAuditLine(theme, visual)));
     },
     invalidate() {},
   };
@@ -2133,6 +2238,20 @@ export function createPiAutoReviewExtension(
     () => config.autoConfirmBoundedAllows,
   );
   const reviewWidget = new UserReviewWidgetController();
+  // pi >= 0.84.4 notification-only events: while a ctx.ui prompt blocks the
+  // session during an active review, show "waiting for you" instead of the
+  // misleading "Waiting for <model>…". Best-effort registration: on older
+  // pi these event names do not exist and the overlay stays off.
+  try {
+    pi.on("ui_prompt_start", (event) => {
+      reviewWidget.promptStart(event);
+    });
+    pi.on("ui_prompt_end", () => {
+      reviewWidget.promptEnd();
+    });
+  } catch {
+    // Older pi: widget behavior is unchanged.
+  }
   const policyAudit = new PolicyAuditController({
     config: () => config.policyAudit,
     cwd: () => context?.cwd,

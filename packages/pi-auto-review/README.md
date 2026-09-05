@@ -31,7 +31,8 @@ that dependency is a hard prerequisite (see [Install and enable](#install-and-en
 > **Prerequisite:** pi-auto-review is an authorizer inside
 > `@gotgenes/pi-permission-system`. Pi does not auto-install peer packages, so
 > install the permission system separately (once per machine) before this
-> extension. Version 0.10.0 requires permission-system 27.x:
+> extension. This release line supports permission-system 29.3.0 through the
+> latest 31.x release:
 
 Node.js 22.13.0 or newer is required. Permission auditing uses Node's built-in
 `node:sqlite`; it does not require a SQLite CLI, system SQLite library, or npm
@@ -75,6 +76,12 @@ Permission-system downgrades authorizer allows on `path` and
 following recognized permission dialog. The bridge is request-ID-bound,
 expires after ten seconds, and is consumed once. Mode, component, request, or
 event-order mismatches leave the original human dialog in place.
+
+Permission-system 31.x also projects paths named directly by `for`/`select`
+word lists and `case` subjects onto the existing `path` and
+`external_directory` surfaces. Those additional requests follow the same
+bounded review and one-shot auto-confirm rules; no new surface is implicitly
+trusted.
 
 Automatic review stops for the current turn after three consecutive denials or
 ten denials in the last fifty reviews. An explicit denial tells the agent that
@@ -192,7 +199,9 @@ The host-generated override:
 - expires after 60 seconds and is consumed once;
 - remains separate from untrusted user/tool evidence;
 - still goes through deterministic hard denies and model review; and
-- cannot be reissued for the same request semantics in that session.
+- cannot be reissued while a previous authorization for it is pending, or
+  again after consumption until the same action is denied afresh (one approval
+  per denial).
 
 It is authorization evidence, not a direct allow.
 
@@ -202,11 +211,15 @@ same session made in the last five minutes. After showing the rationale,
 surface, cwd, command or target summary, and request-hash fingerprint, it
 requires an explicit confirmation and a random `BREAK-GLASS <CODE>` phrase
 within 60 seconds. Successful confirmation creates a 60-second, one-use
-authorization bound to the complete request hash, session, scope, and original
-request ID. The exact retry reruns local hard-deny checks, then allows directly
-without calling the reviewer and, for sandbox adapters, still issues the normal
-one-shot grant. Break glass does not reset circuit-breaker history and can be
-disabled in trusted or project configuration with `breakGlassEnabled: false`.
+authorization bound to the complete request hash, session, and original
+request ID. The request hash deliberately excludes the per-attempt `id` and
+`toolCallId` fields: the exact retry is a brand-new model tool call issued in
+a later turn, so retry-minted identifiers cannot participate in the match.
+The exact retry reruns local hard-deny checks, then allows directly without
+calling the reviewer and, for sandbox adapters, still issues the normal
+one-shot grant. A break-glass allow resets the turn circuit breaker (a human
+re-authorized the scope), and break glass can be disabled in trusted or
+project configuration with `breakGlassEnabled: false`.
 
 ## Boundary broker API
 
@@ -334,11 +347,18 @@ only daily, redacted aggregates. Collection is enabled by default and retains
 180 days. It starts when this version first initializes successfully; no
 permission-system JSONL or RTK history is read or imported.
 
-Before storage, Bash values become fixed signatures such as `git:push`,
-`rtk:git:status`, `npm:test`, or `<path-command>`. Paths become only
+Before storage, Bash values become observed command templates such as
+`git status --short`, `cat *`, or `npm test * --token *`. URLs, paths,
+assignments, quoted values, and option values are replaced with `*`; safe bare
+command words remain in plaintext so the report can emit a matching rule.
+Paths used for path-surface statistics become only
 `workspace`, `temp`, `home`, `external`, `sensitive`, or `unknown`. Request IDs,
-project locations, and matched-rule patterns are HMACed. The database never
-stores raw commands, paths, URLs, credentials, tool inputs, or project names.
+project locations, and matched-rule patterns are HMACed. Syntactically valid
+custom tool names are also retained in plaintext; invalid names stay anonymous
+as `<custom-tool>`. The database never stores raw commands, raw paths,
+URLs, credentials, or non-Bash tool arguments and inputs. Because safe bare Bash
+words are retained, command templates can contain non-secret filenames or
+project-specific labels; inspect suggestions before copying them.
 
 Data lives at
 `~/.pi/agent/extensions/pi-auto-review/policy-audit.sqlite`, beside an
@@ -356,6 +376,31 @@ database is not deleted or rebuilt automatically. Disable new collection with:
 Run `/auto-review-policy-audit` for a durable TUI report that is not sent to the
 LLM. Options are `--days 1..retention`, `--top 1..50`, `--min-count >=1`, and
 `--scope current|all`; defaults are `30`, `20`, `5`, and `current`.
+
+In addition to the redacted statistics, the report proposes copyable
+permission-system fragments. `--scope current` targets
+`.pi/extensions/pi-permission-system/config.json`; `--scope all` targets
+`~/.pi/agent/extensions/pi-permission-system/config.json`. The extension never
+reads, edits, or rewrites either file. Merge suggested Bash patterns into the
+existing `permission.bash` map and place the narrow allow entries after broader
+matching ask entries, because permission-system uses last-match-wins.
+
+Suggestions are discovered entirely from observed audit data; there is no
+built-in tool, executable, Git action, package-manager action, or read-only
+command catalog. Every valid observed permission surface and reliably templated
+Bash command can qualify, including previously unknown tools and write
+operations. Environment prefixes, compound syntax, pipelines, redirection,
+path executables, and unreliable parsing block that Bash template. Forwarded
+requests are statistics-only because the requester's cwd is not available. A
+candidate needs at least `--min-count` successful ask-path approvals and no
+denial, gate error, unavailable confirmation, blocked structural variant, or
+forwarded-only evidence in the selected window. Existing policy/infrastructure
+allows do not count as evidence of user friction. Repeated approval is evidence
+of user preference, not independent proof that a capability is safe.
+
+Schema v2 migrates v1 aggregates transactionally. Old totals remain visible,
+`collecting_since` is preserved, and `recommendations_since` records when safe
+recommendation evidence began; pre-migration data cannot produce a suggestion.
 
 The report is an extension-owned custom entry. It is deliberately not exposed
 as an Agent tool or packaged skill, so neither a tool schema nor skill metadata

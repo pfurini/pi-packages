@@ -1,12 +1,9 @@
 name: pi-subagents compatibility
 
-# Detects drift against the newest published pi-subagents before it surprises
-# users, without relying on a manual devDependency bump each release.
+# Verifies the exact pi-subagents version supported by protected native mode.
 #
 # Jobs:
 #   - pinned-suite : regression canary against the committed (pinned) deps.
-#   - latest-compat: re-runs the type check + test suite against the *latest*
-#                    pi-subagents to surface early compatibility signals.
 #   - model-gate   : opt-in end-to-end gate. Only activates when
 #                    PI_SUBAGENTS_GATE_MODEL and a matching model credential
 #                    secret are configured; otherwise it is inert.
@@ -41,42 +38,15 @@ jobs:
           echo "Pinned pi-subagents: $(node -p "require('./node_modules/pi-subagents/package.json').version")"
           npm run check
           npm test
-      - name: External-isolation contract probe (pinned)
-        run: npm run gate:external-isolation
-
-  latest-compat:
-    name: Latest pi-subagents drift
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
-        with:
-          node-version: 22
-          cache: npm
-      - run: npm ci
-      - name: Record pinned version
-        id: pinned
-        run: echo "version=$(node -p "require('./node_modules/pi-subagents/package.json').version")" >> "$GITHUB_OUTPUT"
-      - name: Install latest pi-subagents
-        run: npm install -D -E pi-subagents@latest --workspace packages/pi-sandbox
-      - name: Show version drift
-        run: |
-          echo "Pinned: ${{ steps.pinned.outputs.version }} -> Latest: $(node -p "require('./node_modules/pi-subagents/package.json').version")"
-      - name: Install sandbox runtime host dependencies
-        run: sudo apt-get update && sudo apt-get install -y ripgrep bubblewrap socat
-      - name: Type check + tests (latest)
-        run: |
-          npm run check
-          npm test
-      - name: External-isolation contract probe (latest)
-        run: npm run gate:external-isolation
+      - name: Native-background compatibility gate (pinned)
+        run: npm run gate:pi-subagents
 
   # Secrets are deliberately NOT declared at job level: a job-level `env:` puts
-  # them in the environment of every step, including `npm ci` and the unpinned
-  # `@latest` installs below, whose lifecycle scripts would then run with the
-  # full provider credential set. Instead a first step reads only the opt-in
-  # flag and publishes a non-secret boolean output; every later step gates on
-  # that output, and the credentials appear only in the final gate step.
+  # them in the environment of every step, including `npm ci` and the global
+  # `pi` install, whose lifecycle scripts would then run with the full provider
+  # credential set. Instead a first step reads only the opt-in flag and
+  # publishes a non-secret boolean output; every later step gates on that
+  # output, and the credentials appear only in the final gate step.
   model-gate:
     name: Model-backed compat gate (opt-in)
     runs-on: ubuntu-latest
@@ -105,9 +75,6 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y tmux ripgrep bubblewrap socat
       - run: npm ci
         if: steps.optin.outputs.enabled == 'true'
-      - name: Install latest pi-subagents
-        if: steps.optin.outputs.enabled == 'true'
-        run: npm install -D -E pi-subagents@latest --workspace packages/pi-sandbox
       - name: Install pi binary (PI_SUBAGENTS_GATE_PI_BINARY)
         if: steps.optin.outputs.enabled == 'true'
         run: npm i -g @earendil-works/pi-coding-agent
